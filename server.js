@@ -6,12 +6,13 @@ const cors = require("cors");
 const app = express();
 
 const PORT = process.env.PORT || 3000;
-const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL;
+const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL || "";
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || "";
 const ALLOWED_EXTENSION_ID = process.env.ALLOWED_EXTENSION_ID || "";
 const NODE_ENV = process.env.NODE_ENV || "development";
 
-if (!SLACK_WEBHOOK_URL) {
-  console.error("Missing SLACK_WEBHOOK_URL");
+if (!SLACK_WEBHOOK_URL && !DISCORD_WEBHOOK_URL) {
+  console.error("Missing webhook configuration. Set SLACK_WEBHOOK_URL and/or DISCORD_WEBHOOK_URL");
   process.exit(1);
 }
 
@@ -72,29 +73,25 @@ function buildSlackPayload({ role, company, link, location, salary, notes }) {
   const fields = [
     {
       type: "mrkdwn",
-      text: `*Role:*
-${safeRole}`
+      text: `*Role:*\n${safeRole}`
     },
     {
       type: "mrkdwn",
-      text: `*Company:*
-${safeCompany}`
+      text: `*Company:*\n${safeCompany}`
     }
   ];
 
   if (safeLocation) {
     fields.push({
       type: "mrkdwn",
-      text: `*Location:*
-${safeLocation}`
+      text: `*Location:*\n${safeLocation}`
     });
   }
 
   if (safeSalary) {
     fields.push({
       type: "mrkdwn",
-      text: `*Salary:*
-${safeSalary}`
+      text: `*Salary:*\n${safeSalary}`
     });
   }
 
@@ -114,8 +111,7 @@ ${safeSalary}`
       type: "section",
       text: {
         type: "mrkdwn",
-        text: `*Job Link:*
-<${safeLink}|Open Posting>`
+        text: `*Job Link:*\n<${safeLink}|Open Posting>`
       }
     }
   ];
@@ -125,8 +121,7 @@ ${safeSalary}`
       type: "section",
       text: {
         type: "mrkdwn",
-        text: `*Notes:*
-${safeNotes}`
+        text: `*Notes:*\n${safeNotes}`
       }
     });
   }
@@ -147,7 +142,36 @@ ${safeNotes}`
   };
 }
 
+function buildDiscordPayload({ role, company, link, location, salary, notes }) {
+  const parts = [
+    `**New Job Captured**`,
+    `**Role:** ${truncate(role, 300)}`,
+    `**Company:** ${truncate(company, 300)}`,
+    `**Job Link:** ${link}`
+  ];
+
+  if (location) {
+    parts.push(`**Location:** ${truncate(location, 300)}`);
+  }
+
+  if (salary) {
+    parts.push(`**Salary:** ${truncate(salary, 300)}`);
+  }
+
+  if (notes) {
+    parts.push(`**Notes:** ${truncate(notes, 1000)}`);
+  }
+
+  parts.push(`**Captured At:** ${new Date().toISOString()}`);
+
+  return {
+    content: parts.join("\n")
+  };
+}
+
 async function postToSlack(payload) {
+  if (!SLACK_WEBHOOK_URL) return;
+
   const response = await fetch(SLACK_WEBHOOK_URL, {
     method: "POST",
     headers: {
@@ -167,15 +191,39 @@ async function postToSlack(payload) {
   }
 }
 
+async function postToDiscord(payload) {
+  if (!DISCORD_WEBHOOK_URL) return;
+
+  const response = await fetch(DISCORD_WEBHOOK_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  });
+
+  if (response.status === 429) {
+    const retryAfter = response.headers.get("Retry-After");
+    throw new Error(`Discord rate limited the request. Retry after ${retryAfter || "unknown"} seconds.`);
+  }
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Discord webhook failed: ${text}`);
+  }
+}
+
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
     env: NODE_ENV,
-    allowedExtensionConfigured: Boolean(ALLOWED_EXTENSION_ID)
+    allowedExtensionConfigured: Boolean(ALLOWED_EXTENSION_ID),
+    slackConfigured: Boolean(SLACK_WEBHOOK_URL),
+    discordConfigured: Boolean(DISCORD_WEBHOOK_URL)
   });
 });
 
-app.post("/api/jobs/send-to-slack", async (req, res) => {
+app.post("/api/jobs/send", async (req, res) => {
   try {
     const {
       role = "",
@@ -200,23 +248,59 @@ app.post("/api/jobs/send-to-slack", async (req, res) => {
       });
     }
 
-    const payload = buildSlackPayload({
+    const cleanData = {
       role: role.trim(),
       company: company.trim(),
       link: link.trim(),
       location: location.trim(),
       salary: salary.trim(),
       notes: notes.trim()
-    });
+    };
 
-    await postToSlack(payload);
+    const slackPayload = buildSlackPayload(cleanData);
+    const discordPayload = buildDiscordPayload(cleanData);
+
+    const results = {
+      slack: null,
+      discord: null
+    };
+
+    if (SLACK_WEBHOOK_URL) {
+      try {
+        await postToSlack(slackPayload);
+        results.slack = "sent";
+      } catch (error) {
+        results.slack = `failed: ${error.message}`;
+      }
+    }
+
+    if (DISCORD_WEBHOOK_URL) {
+      try {
+        await postToDiscord(discordPayload);
+        results.discord = "sent";
+      } catch (error) {
+        results.discord = `failed: ${error.message}`;
+      }
+    }
+
+    const allFailed =
+      (!SLACK_WEBHOOK_URL || String(results.slack).startsWith("failed")) &&
+      (!DISCORD_WEBHOOK_URL || String(results.discord).startsWith("failed"));
+
+    if (allFailed) {
+      return res.status(500).json({
+        error: "Failed to send to all configured destinations",
+        results
+      });
+    }
 
     return res.json({
       success: true,
-      message: "Sent to Slack successfully"
+      message: "Job sent to configured destinations",
+      results
     });
   } catch (error) {
-    console.error("send-to-slack error:", error);
+    console.error("send error:", error);
     return res.status(500).json({
       error: error.message || "Internal server error"
     });
